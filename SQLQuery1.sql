@@ -247,6 +247,19 @@ CREATE TABLE job.JobApplicationHistory (
 );
 GO
 
+CREATE TABLE job.Overtime
+(
+    OvertimeID INT IDENTITY(1,1) PRIMARY KEY,
+    CandidateID INT NOT NULL,
+    DateWorked DATE NOT NULL,
+    HoursWorked INT NOT NULL,
+    Overtime BIT NOT NULL DEFAULT 1,
+    
+    -- Optional: CandidateID কে foreign key করো যদি তোমার job.Candidates বা job.Applications table থাকে
+    -- FOREIGN KEY (CandidateID) REFERENCES job.Candidates(CandidateID)
+);
+
+
 -----========================================================================
                              -- ALTER TABLE
 -----========================================================================
@@ -272,6 +285,7 @@ ADD StatusDate DATETIME NULL;
 
 
 
+
 ALTER TABLE job.Users
 DROP COLUMN Phone;
 
@@ -285,7 +299,12 @@ ADD BonusAmount DECIMAL(18, 2) NULL;
 ALTER TABLE job.InterviewSchedules
 ADD InterviewDurationMinutes INT NULL;
 
-
+--ALTER TABLE job.Overtime
+--ADD 
+--    DateWorked DATE NULL,
+--    CandidateID INT NULL,
+--    Overtime BIT NULL,
+--    HoursWorked INT NULL;
 
 
 
@@ -303,20 +322,361 @@ ON job.Applications (Status, StatusDate);
 GO
 
 --=============================================================================
--- "VIEW" WITH ENCRYPTION
+-- "-- Create the view with schema binding and encryption
+
 --=============================================================================
 
-CREATE VIEW job.EncryptedCandidatesView
+
+USE JobPortalDB;
+GO
+
+CREATE VIEW job.vw_CandidateJobApplications
+WITH SCHEMABINDING, ENCRYPTION
+AS
+SELECT 
+    a.ApplicationID,
+    a.ApplicationDate,
+    a.Status,
+    c.FirstName AS CandidateFirstName,
+    c.LastName AS CandidateLastName,
+    jp.Position AS JobPosition,
+    jp.Location AS JobLocation,
+    comp.CompanyName AS CompanyName
+FROM 
+    job.Applications AS a
+INNER JOIN 
+    job.Candidates AS c ON a.CandidateID = c.CandidateID
+INNER JOIN 
+    job.JobPosts AS jp ON a.JobPostID = jp.JobPostID
+INNER JOIN
+    job.Companies AS comp ON jp.CompanyID = comp.CompanyID;
+GO
+
+--=============================================================================
+-- "-- -- Create a view with encryption
+
+--=============================================================================
+
+CREATE VIEW job.EncryptedJobApplicationsView
 WITH ENCRYPTION
 AS
 SELECT 
-    CandidateID,
-    FirstName,
-    LastName,
-    Email
+    a.ApplicationID,
+    c.FirstName AS CandidateFirstName,
+    c.LastName AS CandidateLastName,
+    j.Position AS JobPosition,
+    a.Status AS ApplicationStatus
 FROM 
-    job.Candidates;
+    job.Applications AS a
+JOIN 
+    job.Candidates AS c ON a.CandidateID = c.CandidateID
+JOIN 
+    job.JobPosts AS j ON a.JobPostID = j.JobPostID;
+GO
+
+
+---===================================================================================================
+							 -- CREATING A "TABULAR FUNCTION"
+--==================================================================================================
+
+-- Create an Inline Table-Valued Function (ITVF)
+CREATE FUNCTION job.GetJobApplicationsByCandidate
+(
+    @CandidateID INT
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT 
+        a.ApplicationID,
+        a.ApplicationDate,
+        j.Position AS JobPosition,
+        a.Status
+    FROM 
+        job.Applications AS a
+    JOIN 
+        job.JobPosts AS j ON a.JobPostID = j.JobPostID
+    WHERE 
+        a.CandidateID = @CandidateID
+);
+GO
+
+
+--SELECT * 
+--FROM job.GetJobApplicationsByCandidate(1);
+---===================================================================================================
+							 ----CREATING "SCALAR FUNCTION" FOR CALCULATION 
+--==================================================================================================
+
+
+-- Create a scalar function to calculate the total applications by a candidate
+CREATE FUNCTION job.fn_GetTotalApplicationsByCandidate
+(
+    @CandidateID INT
+)
+RETURNS INT
+AS
+BEGIN
+    DECLARE @TotalApplications INT;
+
+    -- Calculate the total number of applications submitted by the candidate
+    SELECT @TotalApplications = COUNT(*) 
+    FROM job.Applications
+    WHERE CandidateID = @CandidateID;
+
+    -- Return the result
+    RETURN @TotalApplications;
+END;
+GO
+
+--SELECT job.fn_GetTotalApplicationsByCandidate(1) AS TotalApplications;
+
+
+--SELECT c.CandidateID, c.FirstName, c.LastName, 
+--       job.fn_GetTotalApplicationsByCandidate(c.CandidateID) AS TotalApplications
+--FROM job.Candidates c;
+
+
+-- Create a scalar function to calculate the total salary offer for a candidate
+
+CREATE FUNCTION job.fn_CalculateTotalSalaryOffer
+(
+    @CandidateID INT
+)
+RETURNS DECIMAL(18, 2)
+AS
+BEGIN
+    DECLARE @BaseSalary DECIMAL(18, 2);
+    DECLARE @TotalSalaryOffer DECIMAL(18, 2);
+
+    -- Get the Base Salary from the JobPost based on the Candidate's Application
+    SELECT @BaseSalary = j.Salary
+    FROM job.JobPosts j
+    JOIN job.Applications a ON j.JobPostID = a.JobPostID
+    WHERE a.CandidateID = @CandidateID AND a.Status = 'Pending'; -- Assuming the application is still 'Pending'
+
+    -- Calculate Total Salary Offer (Base Salary in this case)
+    SET @TotalSalaryOffer = ISNULL(@BaseSalary, 0);  -- Default to 0 if no salary is found
+
+    -- Return the Total Salary Offer
+    RETURN @TotalSalaryOffer;
+END;
 GO
 
 
 
+
+/******* OVERTIME FUNCTION ****/
+CREATE FUNCTION job.fn_CalculateOvertimeAmount
+(
+    @EmployeeID INT,
+    @PayPeriodStart DATE,
+    @PayPeriodEnd DATE
+)
+RETURNS DECIMAL(10, 2)
+AS
+BEGIN
+    DECLARE @HourlyRate DECIMAL(10, 2);
+    DECLARE @OvertimeHours INT;
+    DECLARE @OvertimeMultiplier DECIMAL(10, 2);
+    DECLARE @OvertimeAmount DECIMAL(10, 2);
+
+    -- Hourly rate calculation
+    SELECT @HourlyRate = j.Salary / 160
+    FROM job.JobPosts j
+    JOIN job.Applications a ON j.JobPostID = a.JobPostID
+    WHERE a.CandidateID = @EmployeeID;
+
+    -- Overtime hours calculation
+    SELECT @OvertimeHours = ISNULL(SUM(o.HoursWorked), 0)
+    FROM job.Overtime o
+    WHERE o.CandidateID = @EmployeeID
+    AND o.DateWorked BETWEEN @PayPeriodStart AND @PayPeriodEnd;
+
+    -- Overtime multiplier
+    SET @OvertimeMultiplier = 1.5;
+
+    -- Overtime amount calculation
+    SET @OvertimeAmount = @HourlyRate * @OvertimeHours * @OvertimeMultiplier;
+
+    RETURN @OvertimeAmount;
+END;
+GO
+
+
+USE JobPortalDB
+GO
+
+CREATE PROCEDURE job.Employee_Insert
+    @EmployeeName NVARCHAR(100),
+    @Position NVARCHAR(100),
+    @JoiningDate DATE,
+    @Salary DECIMAL(18, 2),
+    @BonusAmount DECIMAL(18, 2) = NULL
+AS
+BEGIN
+    INSERT INTO job.Employees (EmployeeName, Position, JoiningDate, Salary, BonusAmount)
+    VALUES (@EmployeeName, @Position, @JoiningDate, @Salary, @BonusAmount);
+END
+
+
+--update
+
+
+CREATE PROCEDURE job.Employee_Update
+    @EmployeeId INT,
+    @EmployeeName NVARCHAR(100),
+    @Position NVARCHAR(100),
+    @JoiningDate DATE,
+    @Salary DECIMAL(18, 2),
+    @BonusAmount DECIMAL(18, 2) = NULL
+AS
+BEGIN
+    UPDATE job.Employees
+    SET 
+        EmployeeName = @EmployeeName,
+        Position = @Position,
+        JoiningDate = @JoiningDate,
+        Salary = @Salary,
+        BonusAmount = @BonusAmount
+    WHERE EmployeeId = @EmployeeId;
+END
+
+--Delete
+CREATE PROCEDURE job.Employee_Delete
+    @EmployeeId INT
+AS
+BEGIN
+    DELETE FROM job.Employees
+    WHERE EmployeeId = @EmployeeId;
+END
+
+
+
+
+--=====================================================================================
+			--STORE PROCEDURE FOR MULTIPLE TABLE(INCLUDING TEMPORARY TABLE)
+--======================================================================================
+
+-- Create a stored procedure for multiple tables
+CREATE PROCEDURE job.GetJobApplicationsByCompany
+    @CompanyID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temporary Table to Store Final Result
+    CREATE TABLE #JobApplicationDetails
+    (
+        ApplicationID INT,
+        ApplicantName NVARCHAR(100),
+        ApplicantEmail NVARCHAR(100),
+        JobTitle NVARCHAR(150),
+        CompanyName NVARCHAR(150),
+        ApplyDate DATE,
+        ApplicationStatus NVARCHAR(50)
+    );
+
+    -- Insert Data into Temporary Table
+    INSERT INTO #JobApplicationDetails (ApplicationID, ApplicantName, ApplicantEmail, JobTitle, CompanyName, ApplyDate, ApplicationStatus)
+    SELECT 
+        a.ApplicationID,
+        ap.FullName AS ApplicantName,
+        ap.Email AS ApplicantEmail,
+        jp.JobTitle,
+        c.CompanyName,
+        a.ApplyDate,
+        a.ApplicationStatus
+    FROM 
+        job.Applications a
+    INNER JOIN 
+        job.Applicants ap ON a.ApplicantID = ap.ApplicantID
+    INNER JOIN 
+        job.JobPosts jp ON a.JobPostID = jp.JobPostID
+    INNER JOIN 
+        job.Companies c ON jp.CompanyID = c.CompanyID
+    WHERE 
+        c.CompanyID = @CompanyID;
+
+    -- Select Final Result
+    SELECT * FROM #JobApplicationDetails;
+
+    -- Drop the Temporary Table
+    DROP TABLE #JobApplicationDetails;
+END;
+GO
+
+
+--========================================================--===============================================
+				            --  "AFTER TRIGGERS" FOR INSERT, UPDATE, AND DELETE
+--========================================================================================================
+
+-- Create an Audit Table for Application Changes
+CREATE TABLE job.ApplicationAuditLog
+(
+    AuditLogID INT PRIMARY KEY IDENTITY(1,1),
+    Operation NVARCHAR(10) NOT NULL,    -- INSERT, UPDATE, DELETE
+    ApplicationID INT,
+    ApplicantID INT,
+    JobPostID INT,
+    ApplyDate DATE,
+    ApplicationStatus NVARCHAR(50),
+    AuditDateTime DATETIME DEFAULT GETDATE()
+);
+GO
+
+
+
+-- AFTER INSERT Trigger
+CREATE TRIGGER job.trg_AfterInsert_Application
+ON job.Applications
+AFTER INSERT
+AS
+BEGIN
+    INSERT INTO job.ApplicationAuditLog (Operation, ApplicationID,JobPostID)
+    SELECT 
+        'INSERT',
+        i.ApplicationID,
+       
+        i.JobPostID
+            
+    FROM inserted i;
+END;
+GO
+
+-- AFTER UPDATE Trigger
+CREATE TRIGGER job.trg_AfterUpdate_Application
+ON job.Applications
+AFTER UPDATE
+AS
+BEGIN
+    INSERT INTO job.ApplicationAuditLog (Operation, ApplicationID, JobPostID)
+    SELECT 
+        'UPDATE',
+        i.ApplicationID,
+      
+        i.JobPostID
+
+       
+    FROM inserted i;
+END;
+GO
+
+
+-- AFTER DELETE Trigger
+CREATE TRIGGER job.trg_AfterDelete_Application
+ON job.Applications
+AFTER DELETE
+AS
+BEGIN
+    INSERT INTO job.ApplicationAuditLog (Operation, ApplicationID, JobPostID)
+    SELECT 
+        'DELETE',
+        d.ApplicationID,
+       
+        d.JobPostID
+
+    FROM deleted d;
+END;
+GO
